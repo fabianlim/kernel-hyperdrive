@@ -97,6 +97,148 @@ def scatter2scatter_triton_kernel(
 
 
 @triton.autotune(
+    configs=[triton.Config({"BLOCK_N": 128, "BLOCK_K": 32}, num_stages=4, num_warps=4)],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def _scatter2scatter_lora(
+    X_ptr, stride_xm, stride_xk,
+    W_ptr, stride_we, stride_wk, stride_wn,
+    A_ptr, stride_ae, stride_ak, stride_ar,
+    B_ptr, stride_be, stride_br, stride_bn,
+    Y_ptr, stride_ym, stride_yn,
+    grouped_idx_ptr, expert_idxs_ptr, block_start_idx_ptr,
+    FAN_OUT: tl.constexpr,
+    M, K: tl.constexpr, N: tl.constexpr, E: tl.constexpr,
+    R: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    ACC_TYPE: tl.constexpr,
+    OUT_M,
+    scaling,
+    allow_tf32: tl.constexpr,
+    x_grouped: tl.constexpr, y_grouped: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+
+    # The grid is assumed to be num_padded_blocks * N_BLOCK_COUNT. The input tokens are
+    # on the M dimension, that is blocked. The first task is to identify which expert
+    # is being worked on by the kernel instance.
+    # - block_start_idx_ptr contains offsets that allow the processing to occur in M Blocks
+    # - one padded block could contain multiple experts, in which case block_start_idx_ptr
+    #   will index multiple times into a single BLOCK_M.
+    # - e.g., block_start_idx_ptr = [0, 128, 256, 300, 428]
+    #   * there are 300 E_idx = 0 tokens, this requires 3 * 128 blocks to process, at 
+    #     offsets 0, 128, 256.
+    #   * the remaining are E_idx = 1 tokens, where the first 128 block starts at 300,
+    #     then goes on to 428, etc.
+    # - use start index to instantiate the M_block
+    # - M_block indices the X's worked on by this kernel instance
+    N_BLOCK_COUNT = tl.cdiv(N, BLOCK_N)
+    PB_idx = pid // N_BLOCK_COUNT # padded block index
+    N_block_id = pid % N_BLOCK_COUNT
+    M_range = tl.arange(0, BLOCK_M)
+    block_start_idx = tl.load(block_start_idx_ptr + PB_idx) # M block starts from here
+    M_block = tl.max_contiguous(block_start_idx + M_range, BLOCK_M)
+
+    # Assumption: expert_idxs_ptr is a sorted list of expert ids.
+    # - load expert_idxs_ptr into E_idxs
+    # - construct the E_mask so we operate only on expert for this kernel instance (e.g., E_idx)
+    # - in cases where the M_block may overlap multiple experts, then tl.min(E_idxs) or 
+    #   E_idxs[0] (if it is sorted) can be used to infer the expert being worked on
+    E_idxs = tl.load(expert_idxs_ptr + M_block, mask=M_block < (FAN_OUT * M), other=E)
+    E_idx = tl.min(E_idxs) # if we do this we do not need to index the tensor
+    E_mask = E_idxs == E_idx
+
+    # Assumption: grouped_idx_ptr puts X in the order as expected by expert_idxs_ptr.
+    # - same length as expert_idxs_ptr
+
+    # depending on grouped settings, set M_in_idx (input) and M_out_idx (output) appropriately
+    # - if already grouped, then M_idx is not required and use M_block
+    if x_grouped:
+        M_in_idx = M_block
+    else:
+        M_idx = tl.load(grouped_idx_ptr + M_block, mask=E_mask, other=0)
+        M_in_idx = M_idx // FAN_OUT
+
+    if y_grouped:
+        M_out_idx = M_block
+    else:
+        M_idx = tl.load(grouped_idx_ptr + M_block, mask=E_mask, other=0)
+        M_out_idx = M_idx
+
+    # - K_block for input dimension
+    K_block = tl.arange(0, BLOCK_K)
+
+    # - N_block for output dimension
+    N_block = N_block_id * BLOCK_N  + tl.arange(0, BLOCK_N)
+    N_mask = N_block < N
+
+    # - R range for lora dimension
+    R_range = tl.arange(0, R)
+
+    # X: dimensions M, K
+    X_blk_ptrs = X_ptr + M_in_idx[:, None] * stride_xm + K_block[None, :] * stride_xk
+
+    # W: dimensions E, K,         N
+    # A: dimensions E, K, lora_r
+    # B: dimensions E,    lora_r, N
+    W_blk_ptrs = W_ptr + E_idx * stride_we + K_block[:, None] * stride_wk + N_block[None, :] * stride_wn
+    A_blk_ptrs = A_ptr + E_idx * stride_ae + K_block[:, None] * stride_ak                                + R_range[None, :] * stride_ar
+    B_blk_ptrs = B_ptr + E_idx * stride_be                                + N_block[None, :] * stride_bn + R_range[:, None] * stride_br
+
+    # b can be loaded outside because it has no dependence on input dimension K
+    b = tl.load(B_blk_ptrs, mask=N_mask[None, :])
+
+    # for masking
+    no_k_mask = K % BLOCK_K == 0
+    no_n_mask = N % BLOCK_N == 0
+
+    # accumulate loop over input dimension, for iters number of times
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+    iters = tl.cdiv(K, BLOCK_K)
+    for K_block_id in range(0, iters):
+
+        # - load x, w, a quantities depending on NO_K_MASK or NO_N_MASK
+        if no_k_mask:
+            # - if K mask not required
+            x = tl.load(X_blk_ptrs, mask=E_mask[:, None])
+            a = tl.load(A_blk_ptrs)
+
+            if no_n_mask or K_block_id < (iters - 1):
+                # - if N mask also not reqiured
+                w = tl.load(W_blk_ptrs)
+            else:
+                w = tl.load(W_blk_ptrs, mask=N_mask[None, :])
+        else:
+            # - construct K mask (NO_N_MASK has no effect here)
+            K_mask = (K_block_id * BLOCK_K + K_block) < K
+            x = tl.load(X_blk_ptrs, mask=E_mask[:, None] & K_mask[None, :])
+            w = tl.load(W_blk_ptrs, mask=K_mask[:, None] & N_mask[None, :])
+            a = tl.load(A_blk_ptrs, mask=K_mask[:, None])
+
+        # Y = X * (W + A*B*scaling)
+        #   = X * W + X * A * B * scaling
+        # - acummulate base layer
+        acc += tl.dot(x, w, allow_tf32=allow_tf32, out_dtype=ACC_TYPE)
+
+        # - accumulate adapter
+        # - interim = X * A * scaling
+        # - interm wil be of dimensions M_block by lora_r
+        interim = tl.dot(x, a)
+        interim *= scaling
+        acc += tl.dot(interim.to(b.dtype), b, allow_tf32=allow_tf32, out_dtype=ACC_TYPE)
+
+        # move pointers in K
+        # NOTE: b has no dependence on K, so it doesnt need to move
+        X_blk_ptrs += BLOCK_K * stride_xk
+        W_blk_ptrs += BLOCK_K * stride_wk
+        A_blk_ptrs += BLOCK_K * stride_ak
+
+    Y_blk_ptrs = Y_ptr + (M_out_idx[:, None] * stride_ym + N_block[None, :] * stride_yn)
+    tl.store(Y_blk_ptrs, acc, mask=E_mask[:, None] & N_mask[None, :])
+
+
+@triton.autotune(
     configs=[
         # different block M and reducing stages
         triton.Config({"BLOCK_N": 128, "BLOCK_K": 128, "BLOCK_M": 32}, num_stages=4, num_warps=4),
