@@ -1,6 +1,6 @@
 import torch
 
-from .compileable_ops import compileable_bincount, group, group_bwd_W, scatter2scatter
+from .compileable_ops import compileable_bincount, group, group_bwd_W, group_bwd_AB, scatter2scatter
 
 
 BLOCK_M = 128
@@ -30,7 +30,6 @@ def padded_block_indices(sorted_experts_idxs: torch.Tensor, k: int, N_BLOCK_SIZE
 
     return expanded_block_idxs, expert_boundaries_end
 
-
 class _ScatteredExperts(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -45,6 +44,9 @@ class _ScatteredExperts(torch.autograd.Function):
         gates=None,
         grouped_in=False,
         grouped_out=False,
+        expert_lora_A=None, 
+        expert_lora_B=None,
+        lora_alp: float = 0.
     ):
         output = torch.empty(sorted_expert_idxs.size(0), expert_weights.size(-1), device=x.device, dtype=x.dtype)
 
@@ -58,7 +60,16 @@ class _ScatteredExperts(torch.autograd.Function):
             FAN_OUT=k,
             x_grouped=grouped_in,
             y_grouped=grouped_out,
+            A=expert_lora_A, B=expert_lora_B, lora_alp=lora_alp,
         )
+
+        _extra_tensors_to_save = ()
+        if lora_alp > 0 and expert_lora_A is not None and expert_lora_B is not None:
+            _extra_tensors_to_save = (expert_lora_A, expert_lora_B)
+
+            # save some extra context
+            ctx.lora_r = expert_lora_A.size(-1)
+            ctx.lora_alp = lora_alp
 
         if gates is None:
             output_expanded = None
@@ -75,6 +86,7 @@ class _ScatteredExperts(torch.autograd.Function):
             expert_offsets,
             gates,
             output_expanded,
+            *_extra_tensors_to_save,
         )
 
         ctx.grouped_in = grouped_in
@@ -94,10 +106,18 @@ class _ScatteredExperts(torch.autograd.Function):
             expert_offsets,
             gates,
             output_expanded,
+            *_extra_saved_tensors,
         ) = ctx.saved_tensors
         k = ctx.k
         grouped_in = ctx.grouped_in
         grouped_out = ctx.grouped_out
+
+        use_lora = False
+        if hasattr(ctx, 'lora_r'):
+            lora_r = ctx.lora_r
+            lora_alp = ctx.lora_alp
+            expert_lora_A, expert_lora_B = _extra_saved_tensors
+            use_lora = True
 
         if gates is None:
             d_gates = None
@@ -139,21 +159,61 @@ class _ScatteredExperts(torch.autograd.Function):
 
             d_expanded_input = grouped_x
 
-        d_weights = torch.zeros(
-            expert_weights.size(0),
-            grouped_grad_out.size(-1),
-            grouped_x.size(-1),
-            device=grouped_grad_out.device,
-            dtype=grouped_grad_out.dtype,
-        ).permute(0, 2, 1)
+        if not use_lora:
+            d_weights = torch.zeros(
+                expert_weights.size(0),
+                grouped_grad_out.size(-1),
+                grouped_x.size(-1),
+                device=grouped_grad_out.device,
+                dtype=grouped_grad_out.dtype,
+            ).permute(0, 2, 1)
 
-        group_bwd_W(
-            DY=grouped_grad_out,
-            X=grouped_x,
-            expert_offsets=expert_offsets,
-            DW=d_weights,
-            E=expert_weights.size(0),
-        )
+            group_bwd_W(
+                DY=grouped_grad_out,
+                X=grouped_x,
+                expert_offsets=expert_offsets,
+                DW=d_weights,
+                E=expert_weights.size(0),
+            )
+
+            _extra_scatter_kwargs = {}
+            _extra_grads_to_return = (None, None)
+
+        else:
+            d_weights = None
+            DA = torch.zeros(
+                expert_weights.size(0),
+                grouped_x.size(-1),
+                expert_lora_A.size(-1),
+                device=grouped_grad_out.device,
+                dtype=grouped_grad_out.dtype,
+            )
+            DB = torch.zeros(
+                expert_weights.size(0),
+                expert_lora_B.size(1),
+                grouped_grad_out.size(-1),
+                device=grouped_grad_out.device,
+                dtype=grouped_grad_out.dtype,
+            )
+
+            _extra_scatter_kwargs = {
+                "A": expert_lora_B.permute(0, 2, 1), # B^T
+                "B": expert_lora_A.permute(0, 2, 1), # A^T
+                "lora_alp": lora_alp,
+            }
+            _extra_grads_to_return = (DA, DB)
+
+            group_bwd_AB(
+                DY=grouped_grad_out,
+                X=grouped_x,
+                A=expert_lora_A,
+                B=expert_lora_B,
+                expert_offsets=expert_offsets,
+                DA=DA,
+                DB=DB,
+                scaling=(lora_alp / lora_r),
+                E=expert_weights.size(0),
+            )
 
         scatter2scatter(
             X=grouped_grad_out,
@@ -165,6 +225,7 @@ class _ScatteredExperts(torch.autograd.Function):
             FAN_OUT=1,
             x_grouped=True,
             y_grouped=grouped_in,
+            **_extra_scatter_kwargs,
         )
 
         if k == 1:
@@ -188,8 +249,9 @@ class _ScatteredExperts(torch.autograd.Function):
             d_gates,
             None,
             None,
+            # adapter stuff
+            *_extra_grads_to_return, None
         )
-
 
 def scattered_experts(
     inputs,
@@ -202,6 +264,9 @@ def scattered_experts(
     gates=None,
     grouped_in=False,
     grouped_out=False,
+    expert_lora_A=None, 
+    expert_lora_B=None,
+    lora_alp: float = 0.
 ):
     return _ScatteredExperts.apply(
         inputs,
@@ -214,4 +279,7 @@ def scattered_experts(
         gates,
         grouped_in,
         grouped_out,
+        expert_lora_A,
+        expert_lora_B,
+        lora_alp
     )

@@ -101,7 +101,7 @@ def scatter2scatter_triton_kernel(
     key=["M", "N", "K"],
 )
 @triton.jit
-def _scatter2scatter_lora(
+def scatter2scatter_lora_triton_kernel(
     X_ptr, stride_xm, stride_xk,
     W_ptr, stride_we, stride_wk, stride_wn,
     A_ptr, stride_ae, stride_ak, stride_ar,
@@ -113,7 +113,6 @@ def _scatter2scatter_lora(
     R: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     ACC_TYPE: tl.constexpr,
-    OUT_M,
     scaling,
     allow_tf32: tl.constexpr,
     x_grouped: tl.constexpr, y_grouped: tl.constexpr,
@@ -332,6 +331,173 @@ def groupXtY_triton_kernel(
         DW_blk_ptrs = DW_ptr + E_idx * stride_dwe + K_block[:, None] * stride_dwk + N_block[None, :] * stride_dwn
         acc = acc.to(DW_blk_ptrs.dtype.element_ty)
         tl.store(DW_blk_ptrs, acc, mask=K_mask[:, None] & N_mask[None, :])
+
+@triton.autotune(
+    configs=[
+        # different block M and reducing stages
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_M': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_M': 128}, num_stages=1, num_warps=4),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_M': 64}, num_stages=2, num_warps=4),
+
+        # keep 4 stages and keep two 64 block sizes
+        # - NOTE: these can get good performances for low M, but for large M the variation
+        # triton.Config({'BLOCK_N': 128, 'BLOCK_K': 64, 'BLOCK_M': 64}, num_stages=4, num_warps=4),
+        # triton.Config({'BLOCK_N': 64, 'BLOCK_K': 128, 'BLOCK_M': 64}, num_stages=4, num_warps=4),
+        # triton.Config({'BLOCK_N': 64, 'BLOCK_K': 128, 'BLOCK_M': 64}, num_stages=4, num_warps=4),
+    ],
+    key=["N", "K", "E"],
+)
+@triton.jit
+def groupXtY_lora_triton_kernel(
+    DY_ptr, stride_dym, stride_dyn,
+    X_ptr, stride_xm, stride_xk,
+    DA_ptr, stride_dae, stride_dak, stride_dar,
+    DB_ptr, stride_dbe, stride_dbr, stride_dbn,
+    A_ptr, stride_ae, stride_ak, stride_ar,  # transposed
+    B_ptr, stride_be, stride_br, stride_bn,  # transposed
+    expert_offsets_ptr,
+    K: tl.constexpr, N: tl.constexpr, 
+    E: tl.constexpr,
+    R: tl.constexpr,
+    scaling,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    ACC_TYPE: tl.constexpr,
+    allow_tf32: tl.constexpr,
+):
+
+    # this function is required for computing the weight gradients as per the
+    # lora updates:
+    # Y = X * (W + A*B*scaling)
+    #   = X * W + X * A * B * scaling
+
+    # Consider a function f over domain R^n, i.e., f(Y)
+    # - Let DY the be gradients flowing backwards, i.e., DY = df/dY
+    # - Let DY be of dimensions M, N, where N is from the domain of f and M is 
+    #   sequence dimension.
+    # - then the gradients DA for adapter A will be DA = X^t * DY * B^T * scaling
+    #   and the gradients DB for adapter B will be DB = A^t * X^t * DY * scaling
+
+    # The 2D grid is assumed to be:
+    # (num_experts * K_BLOCK_COUNT, N_BLOCK_COUNT)
+    # - the input dimension is K
+    # - the output dimension is N
+    # - X and DY are assumed to be grouped.
+    # - expert_offsets_ptr are the offsets for accessing the expert groups.
+
+    # handling pid0 and pid1
+    # - memory swizzling for minimizing shared memory conflicts
+    pid0 = tl.program_id(axis=0)
+    pid1 = tl.program_id(axis=1)
+    num0 = tl.num_programs(0)
+    num1 = tl.num_programs(1)
+    pid0, pid1 = tl.swizzle2d(pid0, pid1, num0, num1, 4)
+
+    # - get E_idx, K_block_id, N_block_id
+    K_BLOCK_COUNT = tl.cdiv(K, BLOCK_K)
+    E_idx = pid0 // K_BLOCK_COUNT
+    K_block_id = pid0 % K_BLOCK_COUNT
+    N_block_id = pid1
+
+    # - get the offset and ending of the expert group
+    # - use E_idx that points ot the expert, 
+    # - start_idx is the offset. end_idx indicates where the group ends.
+    if E_idx == 0:
+        start_idx = 0
+    else:
+        start_idx = tl.load(expert_offsets_ptr + E_idx - 1).to(tl.int32)
+    end_idx = tl.load(expert_offsets_ptr + E_idx).to(tl.int32)
+
+    # - get the K_block for the input dimension
+    K_block = K_block_id * BLOCK_K + tl.arange(0, BLOCK_K)
+    K_mask = K_block < K
+    K_block = tl.max_contiguous(tl.multiple_of(K_block % K, BLOCK_K), BLOCK_K)
+
+    # - get the N_block for the output dimension
+    N_block = N_block_id * BLOCK_N + tl.arange(0, BLOCK_N)
+    N_mask = N_block < N
+    N_block = tl.max_contiguous(tl.multiple_of(N_block % N, BLOCK_N), BLOCK_N)
+
+    # - R range for lora dimension
+    R_range = tl.arange(0, R)
+
+    # - M block for indices (sequence) dimension
+    M_block = tl.max_contiguous(start_idx + tl.arange(0, BLOCK_M), BLOCK_M)
+
+    # At: dimensions E, lora_r, K (transposed)
+    # Bt: dimensions E, N, lora_r (transposed)
+    At_blk_ptrs = A_ptr + E_idx * stride_ae + K_block[None, :] * stride_ak + R_range[:, None] * stride_ar
+    Bt_blk_ptrs = B_ptr + E_idx * stride_be + N_block[:, None] * stride_bn + R_range[None, :] * stride_br
+
+     # for masking
+    no_k_mask = K % BLOCK_K == 0
+    no_n_mask = N % BLOCK_N == 0
+
+    # - iterate over the (grouped) expert indices (sequence)
+    # - check if end_idx and start_idx are valid
+    if end_idx > start_idx:
+
+        # - get the at and bt (transposed) weights
+        # - do not depend on indices dimension so can be loaded outside of loop
+        if no_k_mask:
+            at = tl.load(At_blk_ptrs)
+        else:
+            at = tl.load(At_blk_ptrs, mask=K_mask[None, :])
+
+        if no_n_mask:
+            bt = tl.load(Bt_blk_ptrs)
+        else:
+            bt = tl.load(Bt_blk_ptrs, mask=N_mask[:, None])
+
+        # - prepare for iteration
+        # - xt (transposed) created from (un-transposed) X_ptr
+        xt_blk_ptrs = X_ptr + M_block[None, :] * stride_xm + K_block[:, None] * stride_xk
+        dy_blk_ptrs = DY_ptr + M_block[:, None] * stride_dym + N_block[None, :] * stride_dyn
+
+        # - for accumulation
+        acc_A = tl.zeros((BLOCK_K, R), dtype=ACC_TYPE)
+        acc_B = tl.zeros((R, BLOCK_N), dtype=ACC_TYPE)
+        iters = tl.cdiv(end_idx - start_idx, BLOCK_M)
+
+        # - iterate
+        for i in range(0, iters):
+
+            # - get the (sequence) M mask 
+            M_mask = (i * BLOCK_M + M_block) < end_idx
+
+            # - load xt and dy
+            if no_k_mask:
+                xt = tl.load(xt_blk_ptrs, mask=M_mask[None, :])
+            else:
+                xt = tl.load(xt_blk_ptrs, mask=M_mask[None, :] & K_mask[:, None])
+            if no_n_mask:
+                dy = tl.load(dy_blk_ptrs, mask=M_mask[:, None])
+            else:
+                dy = tl.load(dy_blk_ptrs, mask=M_mask[:, None] & N_mask[None, :])
+
+            # compute DA = X^t * DY * B^T * scaling
+            interm = tl.dot(dy, bt)
+            interm *= scaling
+            acc_A += tl.dot(xt, interm.to(xt.dtype), out_dtype=ACC_TYPE, allow_tf32=allow_tf32)
+
+            # compute DB = A^t * X^t * DY * scaling
+            interm = tl.dot(at, xt)
+            interm *= scaling
+            acc_B += tl.dot(interm.to(dy.dtype), dy, out_dtype=ACC_TYPE, allow_tf32=allow_tf32)
+
+            # - move pointers
+            xt_blk_ptrs += BLOCK_M * stride_xm
+            dy_blk_ptrs += BLOCK_M * stride_dym
+
+        # - store output for DA and DB
+        DA_blk_ptrs = DA_ptr + E_idx * stride_dae + K_block[:, None] * stride_dak + R_range[None, :] * stride_dar
+        acc_A = acc_A.to(DA_blk_ptrs.dtype.element_ty)
+        tl.store(DA_blk_ptrs, acc_A, mask=K_mask[:, None])
+
+        DB_blk_ptrs = DB_ptr + E_idx * stride_dbe + N_block[None, :] * stride_dbn + R_range[:, None] * stride_dbr
+        acc_B = acc_B.to(DB_blk_ptrs.dtype.element_ty)
+        tl.store(DB_blk_ptrs, acc_B, mask=N_mask[None, :])
+
+
 
 
 @triton.autotune(configs=[triton.Config({"BLOCK_N": 256, "BLOCK_K": 128}, num_stages=4, num_warps=4)], key=["K"])
