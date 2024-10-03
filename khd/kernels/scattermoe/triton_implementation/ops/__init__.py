@@ -1,6 +1,6 @@
 import torch
 
-from .compileable_ops import compileable_bincount, group, group_bwd_W, group_bwd_AB, scatter2scatter
+from .compileable_ops import compileable_bincount, group, group_bwd_W, scatter2scatter
 
 
 BLOCK_M = 128
@@ -159,61 +159,35 @@ class _ScatteredExperts(torch.autograd.Function):
 
             d_expanded_input = grouped_x
 
-        if not use_lora:
-            d_weights = torch.zeros(
-                expert_weights.size(0),
-                grouped_grad_out.size(-1),
-                grouped_x.size(-1),
-                device=grouped_grad_out.device,
-                dtype=grouped_grad_out.dtype,
-            ).permute(0, 2, 1)
+        d_weights = torch.zeros(
+            expert_weights.size(0),
+            grouped_grad_out.size(-1),
+            grouped_x.size(-1),
+            device=grouped_grad_out.device,
+            dtype=grouped_grad_out.dtype,
+        ).permute(0, 2, 1)
 
-            group_bwd_W(
-                DY=grouped_grad_out,
-                X=grouped_x,
-                expert_offsets=expert_offsets,
-                DW=d_weights,
-                E=expert_weights.size(0),
-            )
+        group_bwd_W(
+            DY=grouped_grad_out,
+            X=grouped_x,
+            expert_offsets=expert_offsets,
+            DW=d_weights,
+            E=expert_weights.size(0),
+        )
 
-            _extra_scatter_kwargs = {}
-            _extra_grads_to_return = (None, None)
-
-        else:
-            d_weights = None
-            DA = torch.zeros(
-                expert_weights.size(0),
-                grouped_x.size(-1),
-                expert_lora_A.size(-1),
-                device=grouped_grad_out.device,
-                dtype=grouped_grad_out.dtype,
-            )
-            DB = torch.zeros(
-                expert_weights.size(0),
-                expert_lora_B.size(1),
-                grouped_grad_out.size(-1),
-                device=grouped_grad_out.device,
-                dtype=grouped_grad_out.dtype,
-            )
+        _extra_scatter_kwargs = {}
+        _extra_grads_to_return = (None, None)
+        if use_lora:
+            d_weights_A = d_weights @ expert_lora_B.permute(0, 2, 1)  * (lora_alp / lora_r)
+            d_weights_B =  expert_lora_A.permute(0, 2, 1)  @ d_weights * (lora_alp / lora_r)
+            d_weights = None # zero it
 
             _extra_scatter_kwargs = {
                 "A": expert_lora_B.permute(0, 2, 1), # B^T
                 "B": expert_lora_A.permute(0, 2, 1), # A^T
                 "lora_alp": lora_alp,
             }
-            _extra_grads_to_return = (DA, DB)
-
-            group_bwd_AB(
-                DY=grouped_grad_out,
-                X=grouped_x,
-                A=expert_lora_A,
-                B=expert_lora_B,
-                expert_offsets=expert_offsets,
-                DA=DA,
-                DB=DB,
-                scaling=(lora_alp / lora_r),
-                E=expert_weights.size(0),
-            )
+            _extra_grads_to_return = (d_weights_A, d_weights_B)
 
         scatter2scatter(
             X=grouped_grad_out,

@@ -5,7 +5,7 @@ import triton.language as tl
 from .....constants import LIBRARY_NAME
 from ....utils import torch_custom_op
 from ..kernels import group_triton_kernel, groupXtY_triton_kernel, scatter2scatter_triton_kernel
-from ..kernels import scatter2scatter_lora_triton_kernel, groupXtY_lora_triton_kernel
+from ..kernels import scatter2scatter_lora_triton_kernel
 
 
 BLOCK_M = 128
@@ -209,48 +209,6 @@ def _group_bwd_W(DY: torch.Tensor, X: torch.Tensor, expert_offsets: torch.Tensor
         allow_tf32=torch.backends.cudnn.allow_tf32,
     )
 
-def _group_bwd_AB(
-    DY: torch.Tensor, X: torch.Tensor, 
-    A: torch.Tensor, B: torch.Tensor, scaling: float,
-    expert_offsets: torch.Tensor, DA: torch.Tensor, DB: torch.Tensor, E: int
-) -> None:
-    grid = lambda meta: (E * triton.cdiv(meta["K"], meta["BLOCK_K"]), triton.cdiv(meta["N"], meta["BLOCK_N"]))
-
-    groupXtY_lora_triton_kernel[grid](
-        # DY_ptr, stride_dym, stride_dyk,
-        DY,
-        DY.stride(0),
-        DY.stride(1),
-        # X_ptr, stride_xm, stride_xn,
-        X,
-        X.stride(0),
-        X.stride(1),
-        # DA_ptr, stride_dae, stride_dak, stride_dar,
-        DA,
-        DA.stride(0),
-        DA.stride(1),
-        DA.stride(2),
-        # DB_ptr, stride_dbe, stride_dbr, stride_dbn,
-        DB,
-        DB.stride(0),
-        DB.stride(1),
-        DB.stride(2),
-        # A_ptr, stride_ae, stride_ak, stride_ar,
-        A, A.stride(0), A.stride(1), A.stride(2),
-        # B_ptr, stride_be, stride_br, stride_bn,
-        B, B.stride(0), B.stride(1), B.stride(2),
-        # expert_offsets_ptr,
-        expert_offsets,
-        # K: tl.constexpr, N: tl.constexpr, E: tl.constexpr
-        N=DY.size(-1),
-        K=X.size(-1),
-        R=A.size(2),
-        # ACC_TYPE: tl.constexpr,
-        scaling=scaling,
-        ACC_TYPE=tl.float32,
-        allow_tf32=torch.backends.cudnn.allow_tf32,
-    )
-
 
 # custom op is needed because of https://github.com/pytorch/pytorch/issues/136394
 @torch_custom_op(f"{LIBRARY_NAME}::group_bwd_W", mutates_args={"DW"})
@@ -265,26 +223,6 @@ def group_bwd_W(DY: torch.Tensor, X: torch.Tensor, expert_offsets: torch.Tensor,
         _group_bwd_W_compileable(DY=DY, X=X, expert_offsets=expert_offsets, DW=DW, E=E)
     else:
         _group_bwd_W(DY=DY, X=X, expert_offsets=expert_offsets, DW=DW, E=E)
-
-# custom op is needed because of https://github.com/pytorch/pytorch/issues/136394
-@torch_custom_op(f"{LIBRARY_NAME}::group_bwd_AB", mutates_args={"DA", "DB"})
-def _group_bwd_AB_compileable(
-    DY: torch.Tensor, X: torch.Tensor, 
-    A: torch.Tensor, B: torch.Tensor, scaling: float,
-    expert_offsets: torch.Tensor, DA: torch.Tensor, DB: torch.Tensor, E: int
-) -> None:
-    _group_bwd_AB(DY=DY, X=X, A=A, B=B, scaling=scaling, expert_offsets=expert_offsets, DA=DA, DB=DB, E=E)
-
-
-def group_bwd_AB(
-    DY: torch.Tensor, X: torch.Tensor, 
-    A: torch.Tensor, B: torch.Tensor, scaling: float,
-    expert_offsets: torch.Tensor, DA: torch.Tensor, DB: torch.Tensor, E: int
-) -> None:
-    if torch.compiler.is_compiling():
-        _group_bwd_AB_compileable(DY=DY, X=X, A=A, B=B, scaling=scaling, expert_offsets=expert_offsets, DA=DA, DB=DB, E=E)
-    else:
-        _group_bwd_AB(DY=DY, X=X, A=A, B=B, scaling=scaling, expert_offsets=expert_offsets, DA=DA, DB=DB, E=E)
 
 def _group(
     A: torch.Tensor,
