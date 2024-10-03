@@ -240,7 +240,6 @@ def _group_bwd_AB(
         # K: tl.constexpr, N: tl.constexpr, E: tl.constexpr
         N=DY.size(-1),
         K=X.size(-1),
-        E=E,
         R=A.size(2),
         # ACC_TYPE: tl.constexpr,
         scaling=scaling,
