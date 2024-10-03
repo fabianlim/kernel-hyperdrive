@@ -21,7 +21,8 @@ class ScatterMoETest(TestCommons):
             [2048],  # hidden_size
             [8192],  # intermediate_size
             [True, False],  # is_glu
-            [True, False],  # is_compiling
+            [False, True],  # is_compiling 
+            [0, 16, 32], # lora_r
         )
     )
     def test_scattermoe_triton(
@@ -34,6 +35,7 @@ class ScatterMoETest(TestCommons):
         intermediate_size: int,
         is_glu: bool,
         is_compiling: bool,
+        lora_r: int,
     ) -> None:
         self._test_scattermoe(
             device=device,
@@ -45,6 +47,7 @@ class ScatterMoETest(TestCommons):
             is_glu=is_glu,
             module_class=MoE_Triton,
             is_compiling=is_compiling,
+            lora_r=lora_r,
         )
 
     def _test_scattermoe(
@@ -58,6 +61,7 @@ class ScatterMoETest(TestCommons):
         is_glu: bool,
         module_class: type[nn.Module],
         is_compiling: bool,
+        lora_r: int,
     ) -> None:
         set_seed(SEED)
 
@@ -76,6 +80,8 @@ class ScatterMoETest(TestCommons):
                 is_glu=is_glu,
                 add_bias=False,
                 std=0.02,
+                lora_r=lora_r,
+                lora_alp=(lora_r * 2 if lora_r > 0 else 0.),
             ).to(dtype=dtype)
 
             moe_torch = MoE_Torch(
@@ -87,6 +93,8 @@ class ScatterMoETest(TestCommons):
                 is_glu=is_glu,
                 add_bias=False,
                 std=0.02,
+                lora_r=lora_r,
+                lora_alp=(lora_r * 2 if lora_r > 0 else 0.),
             ).to(dtype=dtype)
 
         if is_compiling:
@@ -137,3 +145,31 @@ class ScatterMoETest(TestCommons):
             atol_float32=6e-3,
             rtol_float32=0,
         )
+
+        weights_torch = [
+            p 
+            for mod in (moe_torch.c_fc, moe_torch.c_proj) 
+            for p in mod.parameters() 
+            if p.requires_grad
+        ]
+        weights_custom = [
+            p 
+            for mod in (moe_custom.c_fc, moe_torch.c_proj)
+            for p in mod.parameters() 
+            if p.requires_grad
+        ]
+
+        for w_torch, w_custom in zip(weights_torch, weights_custom):
+            self.assert_equal_tensors(
+                w_torch.grad,
+                w_custom.grad,
+                False,
+                atol_float16=4e-3,
+                rtol_float16=8e-3,
+                atol_bfloat16=4e-2,
+                rtol_bfloat16=8e-3,
+                atol_float32=6e-3,
+                rtol_float32=8e-3,
+            )
+
+        # check the weigh s

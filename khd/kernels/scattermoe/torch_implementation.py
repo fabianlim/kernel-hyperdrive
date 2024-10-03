@@ -23,8 +23,8 @@ class Experts_Torch(nn.Module):
         self.lora_alp = lora_alp 
         if lora_r > 0:
             self.weight.requires_grad = False
-            self.lora_A = nn.Parameter(torch.empty(num_experts, in_features, lora_r))
-            self.lora_B = nn.Parameter(torch.empty(num_experts, lora_r, out_features))
+            self.lora_A = nn.Parameter(torch.empty(num_experts, lora_r, in_features))
+            self.lora_B = nn.Parameter(torch.empty(num_experts, out_features, lora_r))
 
         self.std = std
 
@@ -49,9 +49,10 @@ class Experts_Torch(nn.Module):
         ]
         if self.lora_r > 0:
             for i in range(self.num_experts):
+                delta = F.linear(input[i], self.lora_A[i], None)
                 output[i] += (
-                    input[i] @ self.lora_A[i] * (self.lora_alp / self.lora_r) @ self.lora_B[i]
-                )
+                    F.linear(delta, self.lora_B[i], None)
+                ) * self.lora_alp / self.lora_r
 
         if not return_list:
             output = torch.cat(output)
@@ -59,14 +60,13 @@ class Experts_Torch(nn.Module):
         return output
 
     def extra_repr(self):
-        if self.lora_r == 0:
-            return "num_experts={}, in_features={}, out_features={}".format(
-                self.num_experts, self.in_features, self.out_features
-            )
-
-        return "num_experts={}, in_features={}, out_features={}, lora_r={}".format(
-            self.num_experts, self.in_features, self.out_features, self.lora_r
+        repr = "num_experts={}, in_features={}, out_features={}".format(
+            self.num_experts, self.in_features, self.out_features
         )
+        if self.lora_r == 0:
+            repr += ", lora_r={}".format(self.lora_r)
+
+        return repr
 
     @torch.no_grad()
     def reset_parameters(self) -> None:

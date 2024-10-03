@@ -24,8 +24,8 @@ class Experts_Triton(Experts_Torch):
         _extra_scatter_kwargs = {}
         if self.lora_r > 0:
             _extra_scatter_kwargs = {
-                "expert_lora_A": self.lora_A,
-                "expert_lora_B": self.lora_B,
+                "expert_lora_A": self.lora_A.permute(0, 2, 1),
+                "expert_lora_B": self.lora_B.permute(0, 2, 1),
                 "lora_alp": self.lora_alp,
             }
 
