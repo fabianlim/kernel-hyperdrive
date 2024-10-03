@@ -135,6 +135,7 @@ class _ScatteredExperts(torch.autograd.Function):
         if grouped_out:
             grouped_grad_out = grad_out
         else:
+            grouped_grad_out = torch.zeros_like(grad_out)
             group(
                 A=grad_out,
                 sorted_expert_idxs=sorted_scattered_idxs,
