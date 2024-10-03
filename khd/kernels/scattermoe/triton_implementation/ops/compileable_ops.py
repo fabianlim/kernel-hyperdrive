@@ -264,14 +264,13 @@ def group_bwd_W(DY: torch.Tensor, X: torch.Tensor, expert_offsets: torch.Tensor,
         _group_bwd_W(DY=DY, X=X, expert_offsets=expert_offsets, DW=DW, E=E)
 
 # custom op is needed because of https://github.com/pytorch/pytorch/issues/136394
-if requires_package("torch", TORCH_VER_SUPPORTS_COMPILE):
-    @torch.library.custom_op(f"{LIBRARY_NAME}::group_bwd_AB", mutates_args={"DA", "DB"})
-    def _group_bwd_AB_compileable(
-        DY: torch.Tensor, X: torch.Tensor, 
-        A: torch.Tensor, B: torch.Tensor, scaling: float,
-        expert_offsets: torch.Tensor, DA: torch.Tensor, DB: torch.Tensor, E: int
-    ) -> None:
-        _group_bwd_AB(DY=DY, X=X, A=A, B=B, scaling=scaling, expert_offsets=expert_offsets, DA=DA, DB=DB, E=E)
+@torch_custom_op(f"{LIBRARY_NAME}::group_bwd_AB", mutates_args={"DA", "DB"})
+def _group_bwd_AB_compileable(
+    DY: torch.Tensor, X: torch.Tensor, 
+    A: torch.Tensor, B: torch.Tensor, scaling: float,
+    expert_offsets: torch.Tensor, DA: torch.Tensor, DB: torch.Tensor, E: int
+) -> None:
+    _group_bwd_AB(DY=DY, X=X, A=A, B=B, scaling=scaling, expert_offsets=expert_offsets, DA=DA, DB=DB, E=E)
 
 
 def group_bwd_AB(

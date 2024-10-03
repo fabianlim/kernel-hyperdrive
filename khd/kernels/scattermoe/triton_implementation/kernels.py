@@ -98,7 +98,7 @@ def scatter2scatter_triton_kernel(
 
 @triton.autotune(
     configs=[triton.Config({"BLOCK_N": 128, "BLOCK_K": 32}, num_stages=4, num_warps=4)],
-    key=["M", "N", "K"],
+    key=["N", "K"],
 )
 @triton.jit
 def scatter2scatter_lora_triton_kernel(
@@ -345,7 +345,7 @@ def groupXtY_triton_kernel(
         # triton.Config({'BLOCK_N': 64, 'BLOCK_K': 128, 'BLOCK_M': 64}, num_stages=4, num_warps=4),
         # triton.Config({'BLOCK_N': 64, 'BLOCK_K': 128, 'BLOCK_M': 64}, num_stages=4, num_warps=4),
     ],
-    key=["N", "K", "E"],
+    key=["N", "K"],
 )
 @triton.jit
 def groupXtY_lora_triton_kernel(
@@ -357,7 +357,6 @@ def groupXtY_lora_triton_kernel(
     B_ptr, stride_be, stride_br, stride_bn,  # transposed
     expert_offsets_ptr,
     K: tl.constexpr, N: tl.constexpr, 
-    E: tl.constexpr,
     R: tl.constexpr,
     scaling,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
