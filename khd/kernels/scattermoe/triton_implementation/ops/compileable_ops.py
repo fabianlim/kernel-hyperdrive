@@ -123,6 +123,9 @@ def _scatter2scatter_compileable(
     FAN_OUT: int,
     x_grouped: bool = False,
     y_grouped: bool = False,
+    A: torch.Tensor = None,
+    B: torch.Tensor = None,
+    lora_alp: float = 0.,
 ) -> None:
     _scatter2scatter(
         X=X,
@@ -134,6 +137,7 @@ def _scatter2scatter_compileable(
         FAN_OUT=FAN_OUT,
         x_grouped=x_grouped,
         y_grouped=y_grouped,
+        A=A, B=B, lora_alp=lora_alp,
     )
 
 
