@@ -20,6 +20,15 @@ class Experts_Triton(Experts_Torch):
         grouped_in=False,
         grouped_out=False,
     ):
+
+        _extra_scatter_kwargs = {}
+        if self.lora_r > 0:
+            _extra_scatter_kwargs = {
+                "expert_lora_A": self.lora_A.permute(0, 2, 1),
+                "expert_lora_B": self.lora_B.permute(0, 2, 1),
+                "lora_alp": self.lora_alp,
+            }
+
         return scattered_experts(
             inputs,
             self.weight.permute(0, 2, 1),
@@ -31,6 +40,7 @@ class Experts_Triton(Experts_Torch):
             gates,
             grouped_in,
             grouped_out,
+            **_extra_scatter_kwargs,
         )
 
 
@@ -45,6 +55,7 @@ class MoE_Triton(MoE_Torch):
         is_glu: bool,
         add_bias: bool,
         std: float,
+        lora_r: int = 0, lora_alp: float = 0., 
     ) -> None:
         nn.Module.__init__(self)
 
@@ -62,6 +73,8 @@ class MoE_Triton(MoE_Torch):
             out_features=2 * self.intermediate_size if is_glu else self.intermediate_size,
             add_bias=add_bias,
             std=std,
+            lora_r=lora_r,
+            lora_alp=lora_alp,
         )
 
         self.act = activation_function
@@ -72,6 +85,8 @@ class MoE_Triton(MoE_Torch):
             out_features=self.hidden_size,
             add_bias=add_bias,
             std=std,
+            lora_r=lora_r,
+            lora_alp=lora_alp,
         )
 
     def _compute_experts(

@@ -30,7 +30,6 @@ def padded_block_indices(sorted_experts_idxs: torch.Tensor, k: int, N_BLOCK_SIZE
 
     return expanded_block_idxs, expert_boundaries_end
 
-
 class _ScatteredExperts(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -45,6 +44,9 @@ class _ScatteredExperts(torch.autograd.Function):
         gates=None,
         grouped_in=False,
         grouped_out=False,
+        expert_lora_A=None, 
+        expert_lora_B=None,
+        lora_alp: float = 0.
     ):
         output = torch.empty(sorted_expert_idxs.size(0), expert_weights.size(-1), device=x.device, dtype=x.dtype)
 
@@ -58,7 +60,16 @@ class _ScatteredExperts(torch.autograd.Function):
             FAN_OUT=k,
             x_grouped=grouped_in,
             y_grouped=grouped_out,
+            A=expert_lora_A, B=expert_lora_B, lora_alp=lora_alp,
         )
+
+        _extra_tensors_to_save = ()
+        if lora_alp > 0 and expert_lora_A is not None and expert_lora_B is not None:
+            _extra_tensors_to_save = (expert_lora_A, expert_lora_B)
+
+            # save some extra context
+            ctx.lora_r = expert_lora_A.size(-1)
+            ctx.lora_alp = lora_alp
 
         if gates is None:
             output_expanded = None
@@ -75,6 +86,7 @@ class _ScatteredExperts(torch.autograd.Function):
             expert_offsets,
             gates,
             output_expanded,
+            *_extra_tensors_to_save,
         )
 
         ctx.grouped_in = grouped_in
@@ -94,10 +106,18 @@ class _ScatteredExperts(torch.autograd.Function):
             expert_offsets,
             gates,
             output_expanded,
+            *_extra_saved_tensors,
         ) = ctx.saved_tensors
         k = ctx.k
         grouped_in = ctx.grouped_in
         grouped_out = ctx.grouped_out
+
+        use_lora = False
+        if hasattr(ctx, 'lora_r'):
+            lora_r = ctx.lora_r
+            lora_alp = ctx.lora_alp
+            expert_lora_A, expert_lora_B = _extra_saved_tensors
+            use_lora = True
 
         if gates is None:
             d_gates = None
@@ -115,6 +135,7 @@ class _ScatteredExperts(torch.autograd.Function):
         if grouped_out:
             grouped_grad_out = grad_out
         else:
+            grouped_grad_out = torch.zeros_like(grad_out)
             group(
                 A=grad_out,
                 sorted_expert_idxs=sorted_scattered_idxs,
@@ -155,6 +176,20 @@ class _ScatteredExperts(torch.autograd.Function):
             E=expert_weights.size(0),
         )
 
+        _extra_scatter_kwargs = {}
+        _extra_grads_to_return = (None, None)
+        if use_lora:
+            d_weights_A = d_weights @ expert_lora_B.permute(0, 2, 1)  * (lora_alp / lora_r)
+            d_weights_B =  expert_lora_A.permute(0, 2, 1)  @ d_weights * (lora_alp / lora_r)
+            d_weights = None # zero it
+
+            _extra_scatter_kwargs = {
+                "A": expert_lora_B.permute(0, 2, 1), # B^T
+                "B": expert_lora_A.permute(0, 2, 1), # A^T
+                "lora_alp": lora_alp,
+            }
+            _extra_grads_to_return = (d_weights_A, d_weights_B)
+
         scatter2scatter(
             X=grouped_grad_out,
             W=expert_weights.permute(0, 2, 1),
@@ -165,6 +200,7 @@ class _ScatteredExperts(torch.autograd.Function):
             FAN_OUT=1,
             x_grouped=True,
             y_grouped=grouped_in,
+            **_extra_scatter_kwargs,
         )
 
         if k == 1:
@@ -188,8 +224,9 @@ class _ScatteredExperts(torch.autograd.Function):
             d_gates,
             None,
             None,
+            # adapter stuff
+            *_extra_grads_to_return, None
         )
-
 
 def scattered_experts(
     inputs,
@@ -202,6 +239,9 @@ def scattered_experts(
     gates=None,
     grouped_in=False,
     grouped_out=False,
+    expert_lora_A=None, 
+    expert_lora_B=None,
+    lora_alp: float = 0.
 ):
     return _ScatteredExperts.apply(
         inputs,
@@ -214,4 +254,7 @@ def scattered_experts(
         gates,
         grouped_in,
         grouped_out,
+        expert_lora_A,
+        expert_lora_B,
+        lora_alp
     )

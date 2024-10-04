@@ -7,7 +7,9 @@ import torch.nn.functional as F
 
 class Experts_Torch(nn.Module):
     def __init__(
-        self, num_experts: int, in_features: int, out_features: int, add_bias: bool = True, std: float | None = None
+        self, num_experts: int, in_features: int, out_features: int, add_bias: bool = True, 
+        std: float | None = None,
+        lora_r: int = 0, lora_alp: float = 0., 
     ) -> None:
         super().__init__()
 
@@ -16,6 +18,13 @@ class Experts_Torch(nn.Module):
         self.bias = None
         if add_bias:
             self.bias = nn.Parameter(torch.empty(num_experts, out_features))
+
+        self.lora_r = lora_r
+        self.lora_alp = lora_alp 
+        if lora_r > 0:
+            self.weight.requires_grad = False
+            self.lora_A = nn.Parameter(torch.empty(num_experts, lora_r, in_features))
+            self.lora_B = nn.Parameter(torch.empty(num_experts, out_features, lora_r))
 
         self.std = std
 
@@ -34,26 +43,41 @@ class Experts_Torch(nn.Module):
         if isinstance(input, torch.Tensor):
             input = input.split(expert_frequency.tolist(), dim=0)
 
-        input = [
+        output = [
             F.linear(input[i], self.weight[i], None if self.bias is None else self.bias[i])
             for i in range(self.num_experts)
         ]
+        if self.lora_r > 0:
+            for i in range(self.num_experts):
+                delta = F.linear(input[i], self.lora_A[i], None)
+                output[i] += (
+                    F.linear(delta, self.lora_B[i], None)
+                ) * self.lora_alp / self.lora_r
 
         if not return_list:
-            input = torch.cat(input)
+            output = torch.cat(output)
 
-        return input
+        return output
 
     def extra_repr(self):
-        return "num_experts={}, in_features={}, out_features={}".format(
+        repr = "num_experts={}, in_features={}, out_features={}".format(
             self.num_experts, self.in_features, self.out_features
         )
+        if self.lora_r == 0:
+            repr += ", lora_r={}".format(self.lora_r)
+
+        return repr
 
     @torch.no_grad()
     def reset_parameters(self) -> None:
         nn.init.normal_(self.weight, mean=0, std=self.std)
         if hasattr(self, "bias") and self.bias is not None:
             self.bias.zero_()
+
+        if self.lora_r > 0:
+            # standard way for initializing lora
+            nn.init.normal_(self.lora_A, mean=0, std=self.std)
+            nn.init.zeros_(self.lora_B)
 
 
 class MoE_Torch(nn.Module):
@@ -67,6 +91,7 @@ class MoE_Torch(nn.Module):
         is_glu: bool,
         add_bias: bool,
         std: float,
+        lora_r: int = 0, lora_alp: float = 0., 
     ) -> None:
         super().__init__()
 
@@ -84,6 +109,8 @@ class MoE_Torch(nn.Module):
             out_features=2 * self.intermediate_size if is_glu else self.intermediate_size,
             add_bias=add_bias,
             std=std,
+            lora_r=lora_r,
+            lora_alp=lora_alp,
         )
 
         self.act = activation_function
@@ -94,6 +121,8 @@ class MoE_Torch(nn.Module):
             out_features=self.hidden_size,
             add_bias=add_bias,
             std=std,
+            lora_r=lora_r,
+            lora_alp=lora_alp,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
