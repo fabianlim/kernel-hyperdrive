@@ -123,19 +123,22 @@ class _ScatteredExperts(torch.autograd.Function):
             d_gates = None
             gates_flat = None
             gate_fan = 1
-            grouped_grad_out = None
+            # grouped_grad_out = None
         else:
             # calculate gates gradient
             d_gates = torch.bmm(output_expanded, grad_out.unsqueeze(2)).squeeze(-1)
             gates_flat = gates.flatten()
             gate_fan = gates.size(1)
             # print("expanded and grouping")
-            grouped_grad_out = output_expanded.flatten(0, 1)  # reuse expanded buffer later
+            # grouped_grad_out = output_expanded.flatten(0, 1)  # reuse expanded buffer later
 
         if grouped_out:
             grouped_grad_out = grad_out
         else:
-            grouped_grad_out = torch.zeros_like(grad_out)
+            grouped_grad_out = torch.zeros(
+                (grad_out.shape[0] * gate_fan, grad_out.shape[1]), 
+                dtype=grad_out.dtype, device=grad_out.device
+            )
             group(
                 A=grad_out,
                 sorted_expert_idxs=sorted_scattered_idxs,
